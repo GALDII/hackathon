@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 import pypdf
 import pandas as pd
 from docx import Document
+import tiktoken
+from typing import List, Dict
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,25 +20,196 @@ except Exception as e:
     print(f"Error initializing Groq client: {e}")
     client = None
 
+def count_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
+    """Count tokens in text using tiktoken (approximate for Groq models)"""
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+    except:
+        # Fallback: rough estimation (4 chars per token)
+        return len(text) // 4
+
+def chunk_text(text: str, max_tokens: int = 6000) -> List[str]:
+    """Split text into chunks that fit within token limits"""
+    # Split by pages/sections first (look for common PDF patterns)
+    paragraphs = text.split('\n\n')
+    
+    chunks = []
+    current_chunk = ""
+    
+    for paragraph in paragraphs:
+        # Check if adding this paragraph would exceed the limit
+        potential_chunk = current_chunk + "\n\n" + paragraph if current_chunk else paragraph
+        
+        if count_tokens(potential_chunk) <= max_tokens:
+            current_chunk = potential_chunk
+        else:
+            # Save current chunk if it has content
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+            
+            # Start new chunk with current paragraph
+            if count_tokens(paragraph) <= max_tokens:
+                current_chunk = paragraph
+            else:
+                # If single paragraph is too long, split it further
+                words = paragraph.split()
+                temp_chunk = ""
+                for word in words:
+                    if count_tokens(temp_chunk + " " + word) <= max_tokens:
+                        temp_chunk += " " + word if temp_chunk else word
+                    else:
+                        if temp_chunk:
+                            chunks.append(temp_chunk.strip())
+                        temp_chunk = word
+                
+                current_chunk = temp_chunk
+    
+    # Add final chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    
+    return chunks
+
 def extract_text_from_pdf(pdf_path):
     """Extracts text from a given PDF file."""
     print(f"Reading PDF from: {pdf_path}")
     with open(pdf_path, 'rb') as file:
         pdf_reader = pypdf.PdfReader(file)
         text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+        total_pages = len(pdf_reader.pages)
+        print(f"PDF has {total_pages} pages")
+        
+        for i, page in enumerate(pdf_reader.pages, 1):
+            page_text = page.extract_text()
+            text += f"\n--- Page {i} ---\n" + page_text
+            if i % 10 == 0:  # Progress indicator for large PDFs
+                print(f"Processed {i}/{total_pages} pages...")
+        
     print("Successfully extracted text from PDF.")
+    print(f"Total text length: {len(text)} characters")
     return text
+
+def analyze_chunk(chunk: str, chunk_index: int) -> Dict:
+    """Analyze a single chunk of text"""
+    system_prompt = f"""
+    You are a highly skilled business analyst AI. You are analyzing chunk {chunk_index + 1} of a larger document.
+    
+    Extract key business metrics, financial data, and performance indicators from this text chunk.
+    Focus on quantitative data, percentages, monetary values, dates, and business KPIs.
+    
+    Return ONLY a JSON object with this structure:
+    {{
+      "chunk_summary": "Brief summary of what this chunk contains",
+      "metrics_found": [
+        {{
+          "metric": "Metric name",
+          "value": "Value with units",
+          "context": "Brief context about where this metric was found"
+        }}
+      ]
+    }}
+    
+    If no meaningful business metrics are found in this chunk, return an empty metrics_found array.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": chunk}
+            ],
+            temperature=0.1
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error analyzing chunk {chunk_index + 1}: {e}")
+        return {"chunk_summary": f"Error processing chunk {chunk_index + 1}", "metrics_found": []}
+
+def synthesize_final_report(chunk_results: List[Dict], total_chunks: int) -> Dict:
+    """Synthesize all chunk results into a final comprehensive report"""
+    
+    # Prepare summary of all findings
+    all_metrics = []
+    chunk_summaries = []
+    
+    for i, result in enumerate(chunk_results):
+        if result.get("chunk_summary"):
+            chunk_summaries.append(f"Chunk {i+1}: {result['chunk_summary']}")
+        
+        for metric in result.get("metrics_found", []):
+            all_metrics.append(metric)
+    
+    # Create synthesis prompt
+    synthesis_prompt = f"""
+    You are a senior business analyst creating a comprehensive report from analysis of {total_chunks} document chunks.
+    
+    Based on the extracted metrics and summaries below, create a final executive report.
+    
+    Chunk Summaries:
+    {chr(10).join(chunk_summaries)}
+    
+    All Extracted Metrics:
+    {json.dumps(all_metrics, indent=2)}
+    
+    Create a final report with this EXACT JSON structure:
+    {{
+      "executive_summary": "A comprehensive 3-4 sentence executive summary of the entire document's key findings and business performance",
+      "key_metrics": [
+        {{
+          "metric": "Most important metric name",
+          "value": "Value with proper formatting",
+          "commentary": "Business significance and context of this metric"
+        }}
+      ]
+    }}
+    
+    Select the 8-10 MOST IMPORTANT and UNIQUE metrics. Avoid duplicates.
+    Prioritize financial metrics, growth rates, and key performance indicators.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": synthesis_prompt}
+            ],
+            temperature=0.1
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"Error in final synthesis: {e}")
+        # Fallback: create report from raw metrics
+        return {
+            "executive_summary": "Document analysis completed with chunked processing due to document size.",
+            "key_metrics": all_metrics[:10]  # Take first 10 metrics as fallback
+        }
 
 def get_insights_from_llm(text_content):
     """
-    Sends the extracted text to a current Groq LLM to get structured insights.
+    Handles both small and large documents by chunking when necessary.
     """
     if not client:
         raise ConnectionError("Groq client not initialized. Check your API key.")
 
-    # This prompt instructs the LLM to act as an analyst and return a specific JSON structure.
+    # Check if document is small enough to process directly
+    token_count = count_tokens(text_content)
+    print(f"Document token count: approximately {token_count:,} tokens")
+    
+    # If document is small enough (under 8000 tokens), process normally
+    if token_count <= 8000:
+        print("Document is small enough for direct processing")
+        return get_insights_direct(text_content)
+    
+    # For large documents, use chunking strategy
+    print("Document is large - using chunking strategy")
+    return get_insights_chunked(text_content)
+
+def get_insights_direct(text_content):
+    """Original processing for smaller documents"""
     system_prompt = """
     You are a highly skilled financial analyst AI. Your task is to analyze the provided text from a business document and extract key performance indicators (KPIs), metrics, and a summary.
 
@@ -57,10 +230,8 @@ def get_insights_from_llm(text_content):
     Extract at least 5-7 of the most important metrics you can find in the text.
     """
 
-    print("Sending text to Groq LLM for analysis...")
     try:
         response = client.chat.completions.create(
-            # FIXED: Using correct current model name
             model="llama-3.3-70b-versatile",
             response_format={"type": "json_object"},
             messages=[
@@ -75,8 +246,31 @@ def get_insights_from_llm(text_content):
         print(f"An error occurred while communicating with the Groq API: {e}")
         return None
 
+def get_insights_chunked(text_content):
+    """Process large documents using chunking strategy"""
+    
+    print("Chunking document for processing...")
+    chunks = chunk_text(text_content, max_tokens=6000)
+    print(f"Created {len(chunks)} chunks")
+    
+    # Analyze each chunk
+    chunk_results = []
+    for i, chunk in enumerate(chunks):
+        print(f"Analyzing chunk {i+1}/{len(chunks)}...")
+        result = analyze_chunk(chunk, i)
+        chunk_results.append(result)
+    
+    print("Synthesizing final report...")
+    final_report = synthesize_final_report(chunk_results, len(chunks))
+    
+    print("Large document analysis completed!")
+    return final_report
+
 def create_excel_report(data, output_path):
     """Creates an Excel report from the extracted data."""
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
     df = pd.DataFrame(data['key_metrics'])
     df = df[['metric', 'value', 'commentary']]
     df.to_excel(output_path, index=False)
@@ -84,6 +278,9 @@ def create_excel_report(data, output_path):
 
 def create_word_report(data, output_path):
     """Creates a Word document report from the extracted data."""
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
     doc = Document()
     doc.add_heading('Business Performance Analysis Report', level=1)
     
