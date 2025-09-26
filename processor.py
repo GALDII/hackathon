@@ -7,6 +7,7 @@ import pandas as pd
 from docx import Document
 import tiktoken
 from typing import List, Dict
+import numpy as np
 
 # Load environment variables from .env file
 load_dotenv()
@@ -89,6 +90,94 @@ def extract_text_from_pdf(pdf_path):
     print("Successfully extracted text from PDF.")
     print(f"Total text length: {len(text)} characters")
     return text
+
+def analyze_excel_file(excel_path):
+    """Analyze Excel file and extract insights"""
+    print(f"Reading Excel file from: {excel_path}")
+    
+    try:
+        # Read all sheets
+        excel_file = pd.ExcelFile(excel_path)
+        all_sheets_data = {}
+        
+        print(f"Excel file has {len(excel_file.sheet_names)} sheet(s): {excel_file.sheet_names}")
+        
+        for sheet_name in excel_file.sheet_names:
+            df = pd.read_excel(excel_path, sheet_name=sheet_name)
+            all_sheets_data[sheet_name] = df
+            print(f"Sheet '{sheet_name}': {df.shape[0]} rows, {df.shape[1]} columns")
+        
+        # Generate comprehensive data summary
+        data_summary = generate_excel_summary(all_sheets_data)
+        
+        return data_summary
+        
+    except Exception as e:
+        print(f"Error reading Excel file: {e}")
+        return None
+
+def generate_excel_summary(all_sheets_data):
+    """Generate a comprehensive summary of Excel data"""
+    summary_text = "EXCEL DATA ANALYSIS SUMMARY\n" + "="*50 + "\n\n"
+    
+    for sheet_name, df in all_sheets_data.items():
+        summary_text += f"SHEET: {sheet_name}\n" + "-"*30 + "\n"
+        summary_text += f"Dimensions: {df.shape[0]} rows × {df.shape[1]} columns\n\n"
+        
+        # Column information
+        summary_text += "COLUMNS:\n"
+        for col in df.columns:
+            dtype = str(df[col].dtype)
+            non_null = df[col].count()
+            null_count = df[col].isnull().sum()
+            summary_text += f"- {col} ({dtype}): {non_null} non-null, {null_count} null\n"
+        
+        # Numerical analysis
+        numerical_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numerical_cols) > 0:
+            summary_text += f"\nNUMERICAL ANALYSIS:\n"
+            for col in numerical_cols:
+                if df[col].count() > 0:  # Only if there's data
+                    stats = df[col].describe()
+                    summary_text += f"- {col}: Min={stats['min']:.2f}, Max={stats['max']:.2f}, Mean={stats['mean']:.2f}, Std={stats['std']:.2f}\n"
+        
+        # Categorical analysis
+        categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+        if len(categorical_cols) > 0:
+            summary_text += f"\nCATEGORICAL ANALYSIS:\n"
+            for col in categorical_cols[:5]:  # Limit to first 5 categorical columns
+                if df[col].count() > 0:
+                    unique_count = df[col].nunique()
+                    top_values = df[col].value_counts().head(3)
+                    summary_text += f"- {col}: {unique_count} unique values. Top: {dict(top_values)}\n"
+        
+        # Sample data
+        summary_text += f"\nSAMPLE DATA (first 3 rows):\n"
+        sample_data = df.head(3).to_string(index=False, max_cols=10)
+        summary_text += sample_data + "\n\n"
+        
+        # Key observations
+        summary_text += f"KEY OBSERVATIONS:\n"
+        summary_text += f"- Total records: {len(df):,}\n"
+        summary_text += f"- Complete rows (no nulls): {df.dropna().shape[0]:,}\n"
+        summary_text += f"- Numerical columns: {len(numerical_cols)}\n"
+        summary_text += f"- Text/categorical columns: {len(categorical_cols)}\n"
+        
+        if len(numerical_cols) > 0:
+            # Find potential KPIs
+            high_value_cols = []
+            for col in numerical_cols:
+                if df[col].count() > 0:
+                    max_val = df[col].max()
+                    if max_val > 1000:  # Potential financial/business metrics
+                        high_value_cols.append((col, max_val))
+            
+            if high_value_cols:
+                summary_text += f"- Potential business metrics found in: {[col for col, _ in high_value_cols]}\n"
+        
+        summary_text += "\n" + "="*60 + "\n\n"
+    
+    return summary_text
 
 def analyze_chunk(chunk: str, chunk_index: int) -> Dict:
     """Analyze a single chunk of text"""
@@ -187,6 +276,55 @@ def synthesize_final_report(chunk_results: List[Dict], total_chunks: int) -> Dic
             "executive_summary": "Document analysis completed with chunked processing due to document size.",
             "key_metrics": all_metrics[:10]  # Take first 10 metrics as fallback
         }
+
+def get_excel_insights_from_llm(excel_summary):
+    """Get insights specifically from Excel data"""
+    if not client:
+        raise ConnectionError("Groq client not initialized. Check your API key.")
+
+    system_prompt = """
+    You are a highly skilled data analyst AI specializing in Excel/spreadsheet analysis. Your task is to analyze the provided Excel data summary and extract key insights, patterns, and business metrics.
+
+    Please provide the output in a structured JSON format ONLY. Do not include any introductory text, explanations, or markdown formatting outside of the JSON structure itself.
+
+    The JSON structure must be as follows:
+    {
+      "executive_summary": "A concise, 2-3 sentence summary of the overall data insights and key findings from the Excel analysis.",
+      "key_metrics": [
+        {
+          "metric": "Data insight or key finding (e.g., 'Average Revenue per Customer', 'Data Completeness Rate', 'Top Performance Category')",
+          "value": "The value or finding (e.g., '$2,450', '95%', 'Product Category A')",
+          "commentary": "A brief, one-sentence comment on the business significance of this finding."
+        }
+      ]
+    }
+
+    Focus on:
+    - Data quality and completeness
+    - Statistical insights from numerical data
+    - Key patterns in categorical data
+    - Business-relevant metrics that can be derived
+    - Data structure and organization insights
+    
+    Extract at least 6-8 key insights from the Excel data.
+    """
+
+    print("Sending Excel summary to Groq LLM for analysis...")
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Here is the Excel data summary:\n\n{excel_summary}"}
+            ]
+        )
+        json_response = response.choices[0].message.content
+        print("Received structured JSON data from Groq LLM for Excel analysis.")
+        return json.loads(json_response)
+    except Exception as e:
+        print(f"An error occurred while communicating with the Groq API: {e}")
+        return None
 
 def get_insights_from_llm(text_content):
     """
@@ -310,13 +448,29 @@ def create_word_report(data, output_path):
     print(f"Word report saved to {output_path}")
 
 def process_document(file_path):
-    """Main orchestration function."""
+    """Main orchestration function that handles both PDF and Excel files."""
     try:
-        document_text = extract_text_from_pdf(file_path)
-        if not document_text:
-            raise ValueError("Could not extract text from the PDF.")
+        file_extension = os.path.splitext(file_path)[1].lower()
+        
+        if file_extension == '.pdf':
+            # Process PDF
+            document_text = extract_text_from_pdf(file_path)
+            if not document_text:
+                raise ValueError("Could not extract text from the PDF.")
 
-        insights_data = get_insights_from_llm(document_text)
+            insights_data = get_insights_from_llm(document_text)
+            
+        elif file_extension in ['.xlsx', '.xls']:
+            # Process Excel
+            excel_summary = analyze_excel_file(file_path)
+            if not excel_summary:
+                raise ValueError("Could not analyze the Excel file.")
+
+            insights_data = get_excel_insights_from_llm(excel_summary)
+            
+        else:
+            raise ValueError(f"Unsupported file type: {file_extension}. Please use PDF, XLSX, or XLS files.")
+        
         if not insights_data:
             raise ValueError("Failed to get insights from the language model.")
         

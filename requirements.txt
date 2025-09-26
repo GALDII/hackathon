@@ -6,3 +6,6 @@ pandas
 openpyxl
 python-docx
 tiktoken
+openpyxl
+pypdf2 
+numpy
